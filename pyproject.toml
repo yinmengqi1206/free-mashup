@@ -1,0 +1,16 @@
+[project]
+name = "free-mashup"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "librosa; python_version < \"3.12\" and (sys_platform != \"darwin\" or platform_machine != \"x86_64\")",
+  "numba; python_version < \"3.12\" and (sys_platform != \"darwin\" or platform_machine != \"x86_64\")",
+  "opencv-python",
+  "moviepy",
+  "numpy",
+  "mediapipe; sys_platform == \"linux\"",
+  "mediapipe; sys_platform == \"win32\"",
+  "mediapipe; sys_platform == \"darwin\" and platform_machine == \"arm64\"",
+]
