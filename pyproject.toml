@@ -9,8 +9,31 @@ dependencies = [
   "numba; python_version < \"3.12\" and (sys_platform != \"darwin\" or platform_machine != \"x86_64\")",
   "opencv-python",
   "moviepy",
-  "numpy",
+  "numpy<2",
   "mediapipe; sys_platform == \"linux\"",
   "mediapipe; sys_platform == \"win32\"",
   "mediapipe; sys_platform == \"darwin\" and platform_machine == \"arm64\"",
+]
+
+[project.optional-dependencies]
+ai = [
+  "open_clip_torch; sys_platform != \"darwin\" or platform_machine == \"arm64\"",
+  "torch; sys_platform != \"darwin\" or platform_machine == \"arm64\"",
+  "pillow",
+]
+ai_intel = [
+  "torch==2.2.2; sys_platform == \"darwin\" and platform_machine == \"x86_64\"",
+  "torchvision==0.17.2; sys_platform == \"darwin\" and platform_machine == \"x86_64\"",
+  "open_clip_torch==3.3.0; sys_platform == \"darwin\" and platform_machine == \"x86_64\"",
+]
+action = [
+  "transformers; sys_platform != \"darwin\" or platform_machine == \"arm64\"",
+  "torch; sys_platform != \"darwin\" or platform_machine == \"arm64\"",
+]
+emotion = [
+  "deepface; sys_platform != \"darwin\" or platform_machine == \"arm64\"",
+  "torch; sys_platform != \"darwin\" or platform_machine == \"arm64\"",
+]
+watch = [
+  "watchdog",
 ]

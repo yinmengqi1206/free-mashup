@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Any as AnyType, Tuple
 
 
 class EngineUnavailable(Exception):
@@ -38,6 +38,7 @@ def _require_moviepy():
             from moviepy.video.fx.TimeMirror import TimeMirror  # type: ignore
             from moviepy.video.fx.Loop import Loop  # type: ignore
             from moviepy.video.fx.Resize import Resize  # type: ignore
+            from moviepy.video.fx.Crop import Crop  # type: ignore
 
             return {
                 "api": "modern",
@@ -48,11 +49,43 @@ def _require_moviepy():
                 "TimeMirror": TimeMirror,
                 "Loop": Loop,
                 "Resize": Resize,
+                "Crop": Crop,
             }
         except Exception as exc:
             raise EngineUnavailable(
                 "moviepy is required for rendering. Install dependencies from requirements.txt"
             ) from exc
+
+
+def _fit_clip(mp: Dict[str, Any], clip: AnyType, target_size: Tuple[int, int]) -> AnyType:
+    tw, th = target_size
+    if tw <= 0 or th <= 0:
+        return clip
+    try:
+        w, h = clip.size
+    except Exception:
+        return clip
+
+    # Scale to cover target (no black bars), then center-crop
+    scale = max(tw / float(w), th / float(h))
+    if mp["api"] == "legacy":
+        clip = clip.resize(scale)
+        # Center crop
+        x_center = clip.size[0] / 2.0
+        y_center = clip.size[1] / 2.0
+        clip = clip.fx(
+            mp["vfx"].crop,
+            x_center=x_center,
+            y_center=y_center,
+            width=tw,
+            height=th,
+        )
+    else:
+        clip = mp["Resize"](scale).apply(clip)
+        x_center = clip.size[0] / 2.0
+        y_center = clip.size[1] / 2.0
+        clip = mp["Crop"](x_center=x_center, y_center=y_center, width=tw, height=th).apply(clip)
+    return clip
 
 
 def apply_script(
@@ -69,7 +102,12 @@ def apply_script(
     VideoFileClip = mp["VideoFileClip"]
     AudioFileClip = mp["AudioFileClip"]
 
-    clip = VideoFileClip(video_path)
+    sources: Dict[str, AnyType] = {}
+
+    def get_source(path: str):
+        if path not in sources:
+            sources[path] = VideoFileClip(path)
+        return sources[path]
 
     music = None
     if music_path:
@@ -78,23 +116,26 @@ def apply_script(
         except Exception:
             music = None
 
-    segments: List[Any] = []
+    segments: List[AnyType] = []
+    target_size: Tuple[int, int] | None = None
 
     for step in script:
         op = step.get("op")
 
         if op in {"SEG", "CUT"}:
+            source_path = step.get("video_path") or video_path
+            source = get_source(source_path)
             start = float(step.get("start", 0.0))
             end = float(step.get("end", start + 0.3))
-            max_end = max(0.0, float(getattr(clip, "duration", 0.0)))
+            max_end = max(0.0, float(getattr(source, "duration", 0.0)))
             start = max(0.0, min(start, max_end))
             end = max(0.0, min(end, max_end))
             if end <= start:
                 continue
             if mp["api"] == "legacy":
-                seg = clip.subclip(start, end)
+                seg = source.subclip(start, end)
             else:
-                seg = clip.subclipped(start, end)
+                seg = source.subclipped(start, end)
 
             for effect in step.get("effects", []):
                 eop = effect.get("op")
@@ -109,6 +150,14 @@ def apply_script(
                         seg = seg.resize(factor)
                     else:
                         seg = mp["Resize"](factor).apply(seg)
+
+            if target_size is None:
+                try:
+                    target_size = seg.size
+                except Exception:
+                    target_size = None
+            if target_size is not None:
+                seg = _fit_clip(mp, seg, target_size)
 
             segments.append(seg)
 
@@ -150,7 +199,7 @@ def apply_script(
             pass
 
     if not segments:
-        segments = [clip]
+        segments = [get_source(video_path)]
 
     final = mp["concat_v"](segments, method="compose")
 
@@ -169,3 +218,14 @@ def apply_script(
                 final = final.with_audio(music)
 
     final.write_videofile(output_path, codec="libx264", audio_codec="aac")
+
+    for clip in sources.values():
+        try:
+            clip.close()
+        except Exception:
+            pass
+    if music is not None:
+        try:
+            music.close()
+        except Exception:
+            pass
