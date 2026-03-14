@@ -219,50 +219,105 @@ def generate_meme_script_from_db(
 
     script: List[Dict[str, Any]] = []
 
+    # Diversity controls
+    recent_window = max(6, min(24, len(segments) // 6))
+    base_cooldown = max(8, min(32, len(segments) // 4))
+    usage: Dict[int, int] = {}
+    cooldown_until: Dict[int, int] = {}
+    recent: List[int] = []
+
+    # Precompute neighbor clusters by energy proximity
+    cluster_order = [c_k for _, c_k in clip_motion]
+    cluster_index = {c_k: i for i, c_k in enumerate(cluster_order)}
+
+    def candidate_pool(seg_label: int, seg_len: float) -> List[ClipRow]:
+        # Primary cluster
+        primary = cluster_map.get(seg_label, 0)
+        pools = []
+        if buckets.get(primary):
+            pools.append(buckets[primary])
+
+        # Neighboring clusters for small pools
+        idx = cluster_index.get(primary, 0)
+        for offset in (1, -1, 2, -2):
+            j = idx + offset
+            if 0 <= j < len(cluster_order):
+                c_k = cluster_order[j]
+                if buckets.get(c_k):
+                    pools.append(buckets[c_k])
+
+        # Flatten
+        flat = [c for p in pools for c in p]
+        if not flat:
+            flat = [c for c in all_clips if _duration_score(c, seg_len) > 0]
+        return flat or all_clips
+
+    def pick_clip(pool: List[ClipRow], seg_len: float, step: int) -> ClipRow:
+        # Filter by cooldown and recent history
+        filtered = []
+        for c in pool:
+            if c.clip_id in recent:
+                continue
+            if cooldown_until.get(c.clip_id, -1) > step:
+                continue
+            filtered.append(c)
+        if not filtered:
+            filtered = pool
+
+        # Sort by duration match, then take top K
+        scored = [(c, _duration_score(c, seg_len)) for c in filtered]
+        scored.sort(key=lambda x: x[1], reverse=True)
+        top_k = max(10, min(40, len(scored) // 4))
+        top = scored[:top_k] if scored else []
+
+        # Prefer lower usage counts for balancing
+        def pick_weight(item: Tuple[ClipRow, float]) -> float:
+            c, s = item
+            u = usage.get(c.clip_id, 0)
+            return (s + 1e-6) / (1.0 + u)
+
+        if top:
+            weights = [pick_weight(x) for x in top]
+            return random.choices([c for c, _ in top], weights=weights, k=1)[0]
+
+        return random.choice(filtered)
+
     for i, seg in enumerate(segments):
         seg_len = max(min_seg, min(max_seg, seg["len"]))
         seg_label = int(seg_labels[i])
-        clip_cluster = cluster_map.get(seg_label, 0)
 
-        # Token-bucket: no replacement within cluster
-        if not buckets[clip_cluster]:
-            # Refill from full cluster (allow reuse after exhaustion)
-            buckets[clip_cluster] = [c for idx, c in enumerate(all_clips) if clip_labels[idx] == clip_cluster]
-            random.shuffle(buckets[clip_cluster])
+        pool = candidate_pool(seg_label, seg_len)
+        clip = pick_clip(pool, seg_len, i)
 
-        # Pick best duration match from bucket
-        best = None
-        best_score = -1.0
-        best_idx = -1
-        for idx, c in enumerate(buckets[clip_cluster]):
-            s = _duration_score(c, seg_len)
-            if s > best_score:
-                best_score = s
-                best = c
-                best_idx = idx
+        # Token-bucket removal to maximize uniqueness
+        for k, bucket in buckets.items():
+            for idx, c in enumerate(bucket):
+                if c.clip_id == clip.clip_id:
+                    bucket.pop(idx)
+                    break
 
-        if best is None:
-            best = random.choice(buckets[clip_cluster])
-            best_idx = buckets[clip_cluster].index(best)
-
-        # Remove token
-        buckets[clip_cluster].pop(best_idx)
-
-        if best.duration > seg_len:
-            start = best.start + random.random() * max(0.01, best.duration - seg_len)
+        if clip.duration > seg_len:
+            start = clip.start + random.random() * max(0.01, clip.duration - seg_len)
             end = start + seg_len
         else:
-            start = best.start
-            end = best.end
+            start = clip.start
+            end = clip.end
 
         script.append(
             {
                 "op": "SEG",
-                "video_path": best.video_path,
+                "video_path": clip.video_path,
                 "start": float(start),
                 "end": float(end),
                 "effects": [],
             }
         )
+
+        # Update diversity trackers
+        usage[clip.clip_id] = usage.get(clip.clip_id, 0) + 1
+        cooldown_until[clip.clip_id] = i + base_cooldown + usage[clip.clip_id]
+        recent.append(clip.clip_id)
+        if len(recent) > recent_window:
+            recent.pop(0)
 
     return script
