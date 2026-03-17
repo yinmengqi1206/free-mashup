@@ -1,30 +1,10 @@
-# 鬼畜视频混剪
+# 音乐电影混剪
 
 ```
-这是一个自动化鬼畜生成视频，放置好原始音视频素材，原素材不动，根据音乐自动选择使用素材，音乐必须选，自动解析音乐节奏视频适配视频，视频的原声音可以做适当取舍，需要有一套适用性很强的鬼畜解析算法
+这是一个自动化剪辑视频，放置好原始音视频素材，原素材不动，根据音乐自动选择使用素材，音乐必须选，自动解析音乐节奏视频适配视频
 ```
 
 ---
-
-# V2 方案（向量库版）
-
-核心思路：
-
-```
-素材视频
-↓
-一次性扫描 + 向量化
-↓
-素材数据库
-
-生成时
-↓
-音频分析
-↓
-全量匹配
-↓
-拼接渲染
-```
 
 ### 初始化素材库（只做一次）
 
@@ -53,30 +33,6 @@ uv run python main.py generate --audio input/audios/music.mp3 --db index/clip_db
 
 # 加歌词字幕（LRC）
 uv run python main.py generate --audio input/audios/music.mp3 --db index/clip_db.sqlite --output output/meme_001.mp4 --lyrics input/audios/lyrics.lrc --quality high --verbose
-```
-
-### 一键执行（推荐顺序）
-
-```bash
-# 1. 扫描素材（首次或新增素材后执行）
-uv run python main.py scan --videos input/videos --db index/clip_db.sqlite --verbose
-
-# 2. 生成视频
-uv run python main.py generate --audio input/audios/music.mp3 --db index/clip_db.sqlite --output output/meme_001.mp4 --verbose
-```
-
-### 生成视频（反复使用）
-
-```bash
-uv run python main.py generate --audio input/audios/music.mp3 --db index/clip_db.sqlite --output output/meme_001.mp4 --verbose
-```
-
-### 新增素材
-
-把新素材放进新目录后，再执行一次 scan：
-
-```bash
-uv run python main.py scan --videos /path/to/new/videos --db index/clip_db.sqlite --verbose
 ```
 
 ### 依赖说明
