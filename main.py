@@ -5,7 +5,7 @@ import json
 import logging
 import os
 from pathlib import Path
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Tuple
 
 from analysis.audio_analysis import analyze_audio
 from engine.video_engine import apply_script, EngineUnavailable
@@ -36,6 +36,41 @@ def pick_first(paths: List[str]) -> str | None:
     return paths[0] if paths else None
 
 
+def _load_lyrics(path: str) -> List[Dict[str, Any]]:
+    """
+    Load .lrc lyrics file into a list of {start, end, text}.
+    If the format is unknown, return empty list.
+    """
+    if not path or not os.path.exists(path):
+        return []
+    lines = Path(path).read_text(encoding="utf-8", errors="ignore").splitlines()
+    entries: List[Tuple[float, str]] = []
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        if line.startswith("[") and "]" in line:
+            tag, text = line.split("]", 1)
+            tag = tag.strip("[")
+            parts = tag.split(":")
+            if len(parts) >= 2:
+                try:
+                    minutes = int(parts[0])
+                    seconds = float(parts[1])
+                    t = minutes * 60 + seconds
+                    text = text.strip()
+                    if text:
+                        entries.append((t, text))
+                except ValueError:
+                    continue
+    entries.sort(key=lambda x: x[0])
+    results: List[Dict[str, Any]] = []
+    for i, (t, text) in enumerate(entries):
+        end = entries[i + 1][0] if i + 1 < len(entries) else t + 3.0
+        results.append({"start": t, "end": end, "text": text})
+    return results
+
+
 def _setup_logging(verbose: bool) -> None:
     level = logging.INFO if verbose else logging.WARNING
     logging.basicConfig(
@@ -45,7 +80,7 @@ def _setup_logging(verbose: bool) -> None:
 
 
 def cmd_scan(args: argparse.Namespace) -> int:
-    _setup_logging(args.verbose)
+    _setup_logging(True)
     scan_folder(args.videos, args.db)
     return 0
 
@@ -78,8 +113,28 @@ def cmd_generate(args: argparse.Namespace) -> int:
         print("No video found in script. Run scan first.")
         return 1
 
+    lyrics_path = args.lyrics
+    if not lyrics_path:
+        default_lyrics = INPUT_DIR / "audios" / "lyrics.lrc"
+        if default_lyrics.exists():
+            lyrics_path = str(default_lyrics)
+
     try:
-        apply_script(fallback_video, music_path, script, output_path)
+        subtitles = _load_lyrics(lyrics_path) if lyrics_path else []
+        if subtitles:
+            logging.getLogger(__name__).info("Loaded %s subtitle lines from %s", len(subtitles), lyrics_path)
+            logging.getLogger(__name__).info("First subtitle: %s", subtitles[0])
+        else:
+            logging.getLogger(__name__).warning("No subtitles loaded (check LRC format/path)")
+        apply_script(
+            fallback_video,
+            music_path,
+            script,
+            output_path,
+            subtitles=subtitles,
+            subtitle_side="center",
+            quality_preset=args.quality,
+        )
     except EngineUnavailable as exc:
         print(str(exc))
         return 2
@@ -103,6 +158,8 @@ def main() -> int:
     gen_parser.add_argument("--db", default=str(DEFAULT_DB), help="Vector DB path")
     gen_parser.add_argument("--output", help="Output video path")
     gen_parser.add_argument("--verbose", action="store_true", help="Verbose logs")
+    gen_parser.add_argument("--lyrics", help="Lyrics file (.lrc) for subtitles")
+    gen_parser.add_argument("--quality", choices=["high", "medium"], default="high", help="Render quality preset")
     gen_parser.set_defaults(func=cmd_generate)
 
     args = parser.parse_args()

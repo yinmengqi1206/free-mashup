@@ -3,6 +3,7 @@ from __future__ import annotations
 import datetime as dt
 import logging
 import os
+import time
 from dataclasses import dataclass
 from typing import Iterator, List, Tuple
 
@@ -47,7 +48,12 @@ def _iter_videos(video_dir: str) -> Iterator[str]:
                 yield os.path.join(root, name)
 
 
-def _detect_scenes(video_path: str, threshold: float = 35.0, min_len: float = 0.4) -> List[Tuple[float, float]]:
+def _detect_scenes(
+    video_path: str,
+    threshold: float = 35.0,
+    min_len: float = 0.4,
+    frame_step: int = 1,
+) -> List[Tuple[float, float]]:
     try:
         import cv2  # type: ignore
     except Exception:
@@ -80,6 +86,13 @@ def _detect_scenes(video_path: str, threshold: float = 35.0, min_len: float = 0.
                 scene_start = t
         prev_gray = gray
 
+        # Skip frames for faster scanning on very large videos
+        if frame_step > 1:
+            for _ in range(frame_step - 1):
+                if not cap.grab():
+                    break
+            frame_idx += frame_step - 1
+
     end_time = frame_idx / fps if fps > 0 else 0.0
     if end_time - scene_start >= min_len:
         scenes.append((scene_start, end_time))
@@ -110,11 +123,16 @@ def _sample_frames(video_path: str, start: float, end: float, samples: int = 12)
 
 def _build_clips(video_path: str, scenes: List[Tuple[float, float]], embedder: ClipEmbedder) -> List[ClipMeta]:
     clips: List[ClipMeta] = []
+    last_log = time.time()
+    log_every = int(os.environ.get("SCAN_LOG_EVERY", "10"))
+    log_every = max(1, log_every)
+    samples = int(os.environ.get("SCAN_SAMPLES", "12"))
+    samples = max(1, samples)
     for idx, (start, end) in enumerate(scenes):
         duration = max(0.0, end - start)
         if duration <= 0.2:
             continue
-        frames, fps = _sample_frames(video_path, start, end, samples=12)
+        frames, fps = _sample_frames(video_path, start, end, samples=samples)
         # Use mid frame for embedding
         mid_idx = frames.shape[0] // 2 if frames.size else 0
         mid_frame = frames[mid_idx] if frames.size else np.zeros((224, 224, 3), dtype=np.uint8)
@@ -141,8 +159,15 @@ def _build_clips(video_path: str, scenes: List[Tuple[float, float]], embedder: C
                 embedding=embedding,
             )
         )
-        if idx % 10 == 0:
-            LOGGER.info("Processed %s clips for %s", idx + 1, os.path.basename(video_path))
+        if idx % log_every == 0 and idx > 0:
+            now = time.time()
+            LOGGER.info(
+                "Processed %s clips for %s (%.1fs since last log)",
+                idx + 1,
+                os.path.basename(video_path),
+                now - last_log,
+            )
+            last_log = now
     return clips
 
 
@@ -156,18 +181,42 @@ def scan_folder(video_dir: str, db_path: str) -> None:
         LOGGER.error("opencv-python is required for scanning. Install dependencies first.")
         return
 
+    frame_step = int(os.environ.get("SCAN_STRIDE", "3"))
+    frame_step = max(1, frame_step)
+
     for video_path in _iter_videos(video_dir):
         stat = os.stat(video_path)
         if not video_needs_processing(db_path, video_path, stat.st_mtime, stat.st_size):
             LOGGER.info("Skip unchanged video: %s", video_path)
             continue
 
-        LOGGER.info("Scanning video: %s", video_path)
-        scenes = _detect_scenes(video_path)
+        # Basic metadata for large files
+        try:
+            import cv2  # type: ignore
+            cap = cv2.VideoCapture(video_path)
+            fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+            frames = cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0.0
+            duration = frames / fps if fps else 0.0
+            cap.release()
+        except Exception:
+            fps = 0.0
+            duration = 0.0
+
+        size_gb = stat.st_size / (1024 ** 3)
+        LOGGER.info(
+            "Scanning video: %s (%.2f GB, %.1f s, stride=%s)",
+            video_path,
+            size_gb,
+            duration,
+            frame_step,
+        )
+        scenes = _detect_scenes(video_path, frame_step=frame_step)
         LOGGER.info("Detected %s scenes", len(scenes))
 
         delete_clips_for_video(db_path, video_path)
+        start_ts = time.time()
         clips = _build_clips(video_path, scenes, embedder)
+        LOGGER.info("Feature extraction done in %.1fs", time.time() - start_ts)
         add_clips(
             db_path,
             (

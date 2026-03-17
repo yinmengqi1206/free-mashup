@@ -8,293 +8,205 @@ import numpy as np
 from indexer.vector_db import ClipRow, list_clips
 
 
-def _build_intervals(beats: List[float], target_duration: float) -> List[float]:
-    if len(beats) >= 2:
-        intervals = [max(0.2, beats[i + 1] - beats[i]) for i in range(len(beats) - 1)]
-        total = sum(intervals)
-        if total < target_duration:
-            median = sorted(intervals)[len(intervals) // 2]
-            while total < target_duration:
-                intervals.append(median)
-                total += median
-        return intervals
-    step = 0.45
-    count = int(max(1, target_duration // step))
-    return [step] * count
+def _normalize(v: np.ndarray) -> np.ndarray:
+    return v / (np.linalg.norm(v) + 1e-8)
 
 
-def _duration_score(clip: ClipRow, seg_len: float) -> float:
-    if seg_len <= 0:
-        return 0.0
-    return 1.0 - min(abs(clip.duration - seg_len) / seg_len, 1.0)
+def _smooth(x: List[float], win: int = 8) -> List[float]:
+    if not x:
+        return []
+    out = []
+    for i in range(len(x)):
+        start = max(0, i - win)
+        end = min(len(x), i + win + 1)
+        out.append(sum(x[start:end]) / max(1, end - start))
+    return out
 
 
-def _audio_window_stats(
-    frame_times: List[float],
-    feature: List[float],
-    start: float,
-    end: float,
-) -> float:
-    if not frame_times or not feature:
-        return 0.0
-    total = 0.0
-    count = 0
-    for t, v in zip(frame_times, feature):
-        if t < start:
-            continue
-        if t > end:
-            break
-        total += v
-        count += 1
-    return total / max(count, 1)
+def _music_sections(frame_times: List[float], rms: List[float]) -> List[Tuple[float, float, str]]:
+    if not frame_times or not rms:
+        return [(0.0, 9999.0, "build")]
+
+    smooth = _smooth(rms, win=12)
+    mean = float(np.mean(smooth))
+    std = float(np.std(smooth))
+
+    labels = []
+    for v in smooth:
+        if v < mean - 0.3 * std:
+            labels.append("intro")
+        elif v < mean + 0.2 * std:
+            labels.append("build")
+        elif v < mean + 0.7 * std:
+            labels.append("climax")
+        else:
+            labels.append("climax")
+
+    sections: List[Tuple[float, float, str]] = []
+    current = labels[0]
+    start_t = frame_times[0]
+    for i in range(1, len(labels)):
+        if labels[i] != current:
+            end_t = frame_times[i]
+            sections.append((start_t, end_t, current))
+            start_t = frame_times[i]
+            current = labels[i]
+    sections.append((start_t, frame_times[-1], current))
+    return sections
 
 
-def _audio_window_vector(
-    frame_times: List[float],
-    chroma: List[List[float]],
-    start: float,
-    end: float,
-) -> np.ndarray:
-    if not frame_times or not chroma:
-        return np.zeros(12, dtype=np.float32)
-    total = np.zeros(12, dtype=np.float32)
-    count = 0
-    for idx, t in enumerate(frame_times):
-        if t < start:
-            continue
-        if t > end:
-            break
-        col = np.asarray([row[idx] for row in chroma], dtype=np.float32)
-        total += col
-        count += 1
-    if count == 0:
-        return total
-    total /= float(count)
-    return total
+def _section_for_time(sections: List[Tuple[float, float, str]], t: float) -> str:
+    for start, end, label in sections:
+        if start <= t <= end:
+            return label
+    return sections[-1][2] if sections else "build"
 
 
-def _kmeans(x: np.ndarray, k: int, iters: int = 12) -> Tuple[np.ndarray, np.ndarray]:
-    n = x.shape[0]
-    if n == 0:
-        return np.zeros((0, x.shape[1])), np.zeros((0,), dtype=np.int64)
-    k = max(1, min(k, n))
-    # Initialize with random samples
-    idx = np.random.choice(n, size=k, replace=False)
-    centroids = x[idx].copy()
-    labels = np.zeros(n, dtype=np.int64)
-    for _ in range(iters):
-        # Assign
-        dists = np.linalg.norm(x[:, None, :] - centroids[None, :, :], axis=2)
-        labels = np.argmin(dists, axis=1)
-        # Update
-        for j in range(k):
-            members = x[labels == j]
-            if len(members) == 0:
-                continue
-            centroids[j] = members.mean(axis=0)
-    return centroids, labels
+def _segment_length(label: str) -> float:
+    if label == "intro":
+        return random.uniform(4.0, 7.0)
+    if label == "climax":
+        return random.uniform(2.0, 3.2)
+    if label == "outro":
+        return random.uniform(4.0, 7.0)
+    return random.uniform(3.0, 5.0)
 
 
-def _build_audio_segments(
-    audio_features: Dict[str, Any],
-    intervals: List[float],
-) -> List[Dict[str, Any]]:
+def _build_segments(audio_features: Dict[str, Any]) -> List[Dict[str, Any]]:
     frame_times = audio_features.get("frame_times", [])
     rms = audio_features.get("rms", [])
-    centroid = audio_features.get("spectral_centroid", [])
-    chroma = audio_features.get("chroma", [])
+    duration = float(audio_features.get("duration", 0.0) or 0.0)
+    if duration <= 0:
+        duration = frame_times[-1] if frame_times else 60.0
 
-    max_rms = max(rms) if rms else 1.0
-    max_centroid = max(centroid) if centroid else 1.0
+    sections = _music_sections(frame_times, rms)
 
     segments = []
     t = 0.0
-    for seg_len in intervals:
-        start_t = t
-        end_t = t + seg_len
-        t = end_t
-
-        r = _audio_window_stats(frame_times, rms, start_t, end_t)
-        c = _audio_window_stats(frame_times, centroid, start_t, end_t)
-        ch = _audio_window_vector(frame_times, chroma, start_t, end_t)
-
-        r_norm = r / max_rms if max_rms > 0 else 0.0
-        c_norm = c / max_centroid if max_centroid > 0 else 0.0
-        ch_norm = ch / (np.linalg.norm(ch) + 1e-8)
-
-        feat = np.concatenate([
-            np.asarray([r_norm, c_norm], dtype=np.float32),
-            ch_norm.astype(np.float32),
-        ])
-        segments.append({
-            "start": start_t,
-            "end": end_t,
-            "len": seg_len,
-            "rms": r_norm,
-            "centroid": c_norm,
-            "feature": feat,
-        })
+    while t < duration:
+        label = _section_for_time(sections, t)
+        seg_len = _segment_length(label)
+        seg_len = max(1.8, min(seg_len, 8.0))
+        if t + seg_len > duration:
+            seg_len = duration - t
+        segments.append({"start": t, "end": t + seg_len, "len": seg_len, "label": label})
+        t += seg_len
     return segments
 
 
-def _build_clip_features(clips: List[ClipRow]) -> np.ndarray:
-    feats = []
-    motion_vals = [c.motion for c in clips]
-    bright_vals = [c.brightness for c in clips]
-    motion_min, motion_max = min(motion_vals), max(motion_vals)
-    bright_min, bright_max = min(bright_vals), max(bright_vals)
-    motion_range = max(motion_max - motion_min, 1.0)
-    bright_range = max(bright_max - bright_min, 1.0)
+def _motion_energy_targets(audio_features: Dict[str, Any], segments: List[Dict[str, Any]]) -> List[float]:
+    frame_times = audio_features.get("frame_times", [])
+    rms = audio_features.get("rms", [])
+    if not frame_times or not rms:
+        return [0.5 for _ in segments]
 
-    for c in clips:
-        motion_norm = (c.motion - motion_min) / motion_range
-        bright_norm = (c.brightness - bright_min) / bright_range
-        colorfulness = float(np.linalg.norm(np.asarray(c.color_std)) / 255.0)
-        feats.append([motion_norm, bright_norm, colorfulness])
-    return np.asarray(feats, dtype=np.float32)
+    max_rms = max(rms) if rms else 1.0
+    targets = []
+    for seg in segments:
+        total = 0.0
+        count = 0
+        for t, v in zip(frame_times, rms):
+            if t < seg["start"]:
+                continue
+            if t > seg["end"]:
+                break
+            total += v
+            count += 1
+        avg = total / max(1, count)
+        targets.append(min(avg / max_rms, 1.0))
+    return targets
 
 
 def generate_meme_script_from_db(
     audio_features: Dict[str, Any],
     db_path: str,
-    min_seg: float = 0.25,
-    max_seg: float = 0.9,
+    min_seg: float = 1.8,
+    max_seg: float = 8.0,
 ) -> List[Dict[str, Any]]:
     """
-    Uniqueness-first, category-driven strategy:
-    1) Cluster audio segments into melody/energy categories.
-    2) Cluster clips into visual categories.
-    3) Map audio clusters to clip clusters (energy -> motion).
-    4) Use token-bucket per cluster (no replacement), refill only when empty.
+    Cinematic montage strategy:
+    - Long shots (2.5-6s) with section-aware pacing
+    - Movie grouping (soft limit 3-4 shots)
+    - Strong diversity across movies
+    - Energy -> motion matching
     """
-    beats: List[float] = audio_features.get("beats", [])
-    target_duration = float(audio_features.get("duration", 0.0)) or 0.0
-    if target_duration <= 0:
-        target_duration = beats[-1] if beats else 10.0
-
-    intervals = _build_intervals(beats, target_duration)
     all_clips = list_clips(db_path)
     if not all_clips:
         raise ValueError("No clips available in vector database.")
 
-    segments = _build_audio_segments(audio_features, intervals)
-    seg_k = min(8, max(2, len(segments) // 8))
-    clip_k = seg_k
+    segments = _build_segments(audio_features)
+    energy_targets = _motion_energy_targets(audio_features, segments)
 
-    # Cluster audio segments
-    seg_features = np.asarray([s["feature"] for s in segments], dtype=np.float32)
-    seg_centroids, seg_labels = _kmeans(seg_features, seg_k)
+    # Normalize motion for scoring
+    motion_vals = [c.motion for c in all_clips]
+    motion_min, motion_max = min(motion_vals), max(motion_vals)
+    motion_range = max(motion_max - motion_min, 1.0)
 
-    # Cluster clips by visual features
-    clip_features = _build_clip_features(all_clips)
-    clip_centroids, clip_labels = _kmeans(clip_features, clip_k)
+    # Usage tracking
+    used_clip_ids: set[int] = set()
+    recent: List[int] = []
+    recent_window = 8
 
-    # Map audio clusters to clip clusters by energy->motion ranking
-    seg_energy = []
-    for k in range(seg_k):
-        idxs = np.where(seg_labels == k)[0]
-        avg_rms = float(np.mean([segments[i]["rms"] for i in idxs])) if len(idxs) else 0.0
-        avg_centroid = float(np.mean([segments[i]["centroid"] for i in idxs])) if len(idxs) else 0.0
-        seg_energy.append((k, avg_rms + 0.5 * avg_centroid))
-    seg_energy.sort(key=lambda x: x[1])
+    video_use: Dict[str, int] = {}
+    for c in all_clips:
+        video_use.setdefault(c.video_path, 0)
 
-    clip_motion = []
-    for k in range(clip_k):
-        idxs = np.where(clip_labels == k)[0]
-        avg_motion = float(np.mean([all_clips[i].motion for i in idxs])) if len(idxs) else 0.0
-        clip_motion.append((k, avg_motion))
-    clip_motion.sort(key=lambda x: x[1])
-
-    cluster_map = {}
-    for (s_k, _), (c_k, _) in zip(seg_energy, clip_motion):
-        cluster_map[s_k] = c_k
-
-    # Build token buckets per clip cluster
-    buckets: Dict[int, List[ClipRow]] = {k: [] for k in range(clip_k)}
-    for idx, c in enumerate(all_clips):
-        buckets[clip_labels[idx]].append(c)
-
-    for k in buckets:
-        random.shuffle(buckets[k])
+    current_movie = None
+    current_run = 0
+    max_run = 4
 
     script: List[Dict[str, Any]] = []
 
-    # Diversity controls
-    recent_window = max(6, min(24, len(segments) // 6))
-    base_cooldown = max(8, min(32, len(segments) // 4))
-    usage: Dict[int, int] = {}
-    cooldown_until: Dict[int, int] = {}
-    recent: List[int] = []
+    for i, seg in enumerate(segments):
+        seg_len = max(min_seg, min(max_seg, seg["len"]))
+        target_energy = energy_targets[i]
+        target_motion = motion_min + target_energy * motion_range
 
-    # Precompute neighbor clusters by energy proximity
-    cluster_order = [c_k for _, c_k in clip_motion]
-    cluster_index = {c_k: i for i, c_k in enumerate(cluster_order)}
+        # Candidate pool: allow slightly shorter clips for diversity
+        pool = [
+            c
+            for c in all_clips
+            if c.clip_id not in used_clip_ids and c.duration >= seg_len * 0.6
+        ]
+        if not pool:
+            pool = [c for c in all_clips if c.duration >= seg_len * 0.6]
+            used_clip_ids.clear()
 
-    def candidate_pool(seg_label: int, seg_len: float) -> List[ClipRow]:
-        # Primary cluster
-        primary = cluster_map.get(seg_label, 0)
-        pools = []
-        if buckets.get(primary):
-            pools.append(buckets[primary])
+        # If some videos are underused, focus on them
+        min_use = min(video_use.values()) if video_use else 0
+        max_use = max(video_use.values()) if video_use else 0
+        if max_use - min_use >= 2:
+            underused = {v for v, u in video_use.items() if u == min_use}
+            under_pool = [c for c in pool if c.video_path in underused]
+            if under_pool:
+                pool = under_pool
 
-        # Neighboring clusters for small pools
-        idx = cluster_index.get(primary, 0)
-        for offset in (1, -1, 2, -2):
-            j = idx + offset
-            if 0 <= j < len(cluster_order):
-                c_k = cluster_order[j]
-                if buckets.get(c_k):
-                    pools.append(buckets[c_k])
-
-        # Flatten
-        flat = [c for p in pools for c in p]
-        if not flat:
-            flat = [c for c in all_clips if _duration_score(c, seg_len) > 0]
-        return flat or all_clips
-
-    def pick_clip(pool: List[ClipRow], seg_len: float, step: int) -> ClipRow:
-        # Filter by cooldown and recent history
-        filtered = []
+        # Score: duration match + motion match + diversity + continuity
+        scored: List[Tuple[float, ClipRow]] = []
+        avg_use = (sum(video_use.values()) / max(len(video_use), 1)) if video_use else 0.0
         for c in pool:
             if c.clip_id in recent:
                 continue
-            if cooldown_until.get(c.clip_id, -1) > step:
-                continue
-            filtered.append(c)
-        if not filtered:
-            filtered = pool
+            duration_score = 1.0 - min(abs(c.duration - seg_len) / seg_len, 1.0)
+            motion_score = 1.0 - min(abs(c.motion - target_motion) / motion_range, 1.0)
+            diversity_bonus = 0.12 if video_use.get(c.video_path, 0) == 0 else 0.0
+            usage_penalty = 0.08 * (video_use.get(c.video_path, 0) / max(avg_use + 1.0, 1.0))
+            continuity_bonus = 0.08 if current_movie and c.video_path == current_movie else 0.0
+            score = 0.55 * duration_score + 0.35 * motion_score + diversity_bonus + continuity_bonus - usage_penalty
+            scored.append((score, c))
 
-        # Sort by duration match, then take top K
-        scored = [(c, _duration_score(c, seg_len)) for c in filtered]
-        scored.sort(key=lambda x: x[1], reverse=True)
-        top_k = max(10, min(40, len(scored) // 4))
-        top = scored[:top_k] if scored else []
+        scored.sort(key=lambda x: x[0], reverse=True)
+        top_k = max(10, min(30, len(scored) // 4))
+        top = [c for _, c in scored[:top_k]] if scored else []
 
-        # Prefer lower usage counts for balancing
-        def pick_weight(item: Tuple[ClipRow, float]) -> float:
-            c, s = item
-            u = usage.get(c.clip_id, 0)
-            return (s + 1e-6) / (1.0 + u)
+        # Enforce soft movie run limit
+        if current_movie and current_run >= max_run:
+            top = [c for c in top if c.video_path != current_movie] or top
 
         if top:
-            weights = [pick_weight(x) for x in top]
-            return random.choices([c for c, _ in top], weights=weights, k=1)[0]
-
-        return random.choice(filtered)
-
-    for i, seg in enumerate(segments):
-        seg_len = max(min_seg, min(max_seg, seg["len"]))
-        seg_label = int(seg_labels[i])
-
-        pool = candidate_pool(seg_label, seg_len)
-        clip = pick_clip(pool, seg_len, i)
-
-        # Token-bucket removal to maximize uniqueness
-        for k, bucket in buckets.items():
-            for idx, c in enumerate(bucket):
-                if c.clip_id == clip.clip_id:
-                    bucket.pop(idx)
-                    break
+            clip = random.choice(top)
+        else:
+            clip = random.choice(pool)
 
         if clip.duration > seg_len:
             start = clip.start + random.random() * max(0.01, clip.duration - seg_len)
@@ -313,11 +225,17 @@ def generate_meme_script_from_db(
             }
         )
 
-        # Update diversity trackers
-        usage[clip.clip_id] = usage.get(clip.clip_id, 0) + 1
-        cooldown_until[clip.clip_id] = i + base_cooldown + usage[clip.clip_id]
+        used_clip_ids.add(clip.clip_id)
         recent.append(clip.clip_id)
         if len(recent) > recent_window:
             recent.pop(0)
+
+        video_use[clip.video_path] = video_use.get(clip.video_path, 0) + 1
+
+        if current_movie == clip.video_path:
+            current_run += 1
+        else:
+            current_movie = clip.video_path
+            current_run = 1
 
     return script

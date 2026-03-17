@@ -32,6 +32,29 @@
 uv run python main.py scan --videos input/videos --db index/clip_db.sqlite --verbose
 ```
 
+大体积视频会非常慢，可选加速（降低精度）：
+
+```bash
+# 每 N 帧取一帧做场景检测，数值越大越快
+SCAN_STRIDE=3 uv run python main.py scan --videos input/videos --db index/clip_db.sqlite --verbose
+
+# 每个场景采样帧数（越小越快）
+SCAN_SAMPLES=6 uv run python main.py scan --videos input/videos --db index/clip_db.sqlite --verbose
+
+# 每 N 个片段输出一次进度日志
+SCAN_LOG_EVERY=10 uv run python main.py scan --videos input/videos --db index/clip_db.sqlite --verbose
+```
+
+### 高质量输出与字幕
+
+```bash
+# 高质量输出
+uv run python main.py generate --audio input/audios/music.mp3 --db index/clip_db.sqlite --output output/meme_001.mp4 --quality high
+
+# 加歌词字幕（LRC）
+uv run python main.py generate --audio input/audios/music.mp3 --db index/clip_db.sqlite --output output/meme_001.mp4 --lyrics input/audios/lyrics.lrc --quality high --verbose
+```
+
 ### 一键执行（推荐顺序）
 
 ```bash
